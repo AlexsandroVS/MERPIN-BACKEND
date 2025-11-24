@@ -64,10 +64,17 @@ app.add_middleware(
 
 # Global variables to hold processed data and trained model
 # These will be loaded on startup
+# Global variables to hold processed data and trained model
+# These will be loaded on startup
 processed_data_df: pd.DataFrame = pd.DataFrame()
 trained_prophet_model = None
 # Placeholder for the full historical data (before aggregation) for bestsellers analysis
 full_historical_df: pd.DataFrame = pd.DataFrame() 
+
+# Processing Status
+is_processing: bool = False
+last_processed_time: str = None
+processing_error: str = None 
 
 # Define Pydantic models for request/response
 class PredictionResponse(BaseModel):
@@ -420,7 +427,10 @@ async def reload_data_and_model():
     Asynchronously re-runs the ETL pipeline and retrains the model.
     This function is intended to be called after new data is uploaded.
     """
-    global processed_data_df, trained_prophet_model, full_historical_df
+    global processed_data_df, trained_prophet_model, full_historical_df, is_processing, last_processed_time, processing_error
+    
+    is_processing = True
+    processing_error = None
     
     current_dir = os.path.dirname(__file__)
     data_path = os.path.join(current_dir, '..', 'CSV')
@@ -437,18 +447,31 @@ async def reload_data_and_model():
         # Clear cache after reload
         await FastAPICache.clear()
         logger.info("Cache cleared.")
+        
+        last_processed_time = datetime.now().isoformat()
 
     except Exception as e:
         logger.error(f"Data Reload Error: {e}")
-        # In a production scenario, you might want more robust error handling,
-        # like reverting to the old model or notifying an admin.
-        raise HTTPException(status_code=500, detail=f"Failed to reload data and retrain model: {e}")
+        processing_error = str(e)
+    finally:
+        is_processing = False
+
+@app.get("/status")
+async def get_processing_status():
+    """
+    Returns the current status of data processing.
+    """
+    return {
+        "processing": is_processing,
+        "last_updated": last_processed_time,
+        "error": processing_error
+    }
 
 @app.post("/upload/")
-async def upload_data_files(files: List[UploadFile] = File(...)):
+async def upload_data_files(files: List[UploadFile] = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
     """
     Uploads new data files (CSV or JSON), saves them, and triggers a data reload and model retraining.
-    Waits for the reload to complete before returning.
+    Returns immediately and runs processing in background.
     """
     # Ensure the data directory exists
     current_dir = os.path.dirname(__file__)
@@ -473,12 +496,12 @@ async def upload_data_files(files: List[UploadFile] = File(...)):
         finally:
             file.file.close()
 
-    logger.info(f"Files {filenames} uploaded. Starting synchronous reload...")
+    logger.info(f"Files {filenames} uploaded. Starting background reload...")
     
-    # Reload data and model synchronously
-    await reload_data_and_model()
+    # Reload data and model in background
+    background_tasks.add_task(reload_data_and_model)
 
-    return {"message": f"Successfully uploaded {len(files)} files and reloaded data."}
+    return {"message": f"Successfully uploaded {len(files)} files. Processing started in background."}
 
 @app.get("/export/", response_class=StreamingResponse)
 async def export_data():
